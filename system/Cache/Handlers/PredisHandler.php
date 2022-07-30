@@ -127,7 +127,9 @@ class PredisHandler extends BaseHandler
             return false;
         }
 
-        $this->redis->expireat($key, time() + $ttl);
+        if ($ttl) {
+            $this->redis->expireat($key, time() + $ttl);
+        }
 
         return true;
     }
@@ -220,6 +222,6 @@ class PredisHandler extends BaseHandler
      */
     public function isSupported(): bool
     {
-        return class_exists('Predis\Client');
+        return class_exists(Client::class);
     }
 }

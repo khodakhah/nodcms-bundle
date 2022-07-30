@@ -228,38 +228,77 @@ class CLI
         }
 
         if (is_string($options)) {
-            $extraOutput = ' [' . static::color($options, 'white') . ']';
+            $extraOutput = ' [' . static::color($options, 'green') . ']';
             $default     = $options;
         }
 
         if (is_array($options) && $options) {
             $opts               = $options;
-            $extraOutputDefault = static::color($opts[0], 'white');
+            $extraOutputDefault = static::color($opts[0], 'green');
 
             unset($opts[0]);
 
             if (empty($opts)) {
                 $extraOutput = $extraOutputDefault;
             } else {
-                $extraOutput  = ' [' . $extraOutputDefault . ', ' . implode(', ', $opts) . ']';
-                $validation[] = 'in_list[' . implode(',', $options) . ']';
+                $extraOutput  = '[' . $extraOutputDefault . ', ' . implode(', ', $opts) . ']';
+                $validation[] = 'in_list[' . implode(', ', $options) . ']';
             }
 
             $default = $options[0];
         }
 
-        static::fwrite(STDOUT, $field . $extraOutput . ': ');
+        static::fwrite(STDOUT, $field . (trim($field) ? ' ' : '') . $extraOutput . ': ');
 
         // Read the input from keyboard.
         $input = trim(static::input()) ?: $default;
 
         if ($validation) {
-            while (! static::validate($field, $input, $validation)) {
+            while (! static::validate(trim($field), $input, $validation)) {
                 $input = static::prompt($field, $options, $validation);
             }
         }
 
-        return empty($input) ? '' : $input;
+        return $input;
+    }
+
+    /**
+     * prompt(), but based on the option's key
+     *
+     * @param array|string      $text       Output "field" text or an one or two value array where the first value is the text before listing the options
+     *                                      and the second value the text before asking to select one option. Provide empty string to omit
+     * @param array             $options    A list of options (array(key => description)), the first option will be the default value
+     * @param array|string|null $validation Validation rules
+     *
+     * @return string The selected key of $options
+     *
+     * @codeCoverageIgnore
+     */
+    public static function promptByKey($text, array $options, $validation = null): string
+    {
+        if (is_string($text)) {
+            $text = [$text];
+        } elseif (! is_array($text)) {
+            throw new InvalidArgumentException('$text can only be of type string|array');
+        }
+
+        if (! $options) {
+            throw new InvalidArgumentException('No options to select from were provided');
+        }
+
+        if ($line = array_shift($text)) {
+            CLI::write($line);
+        }
+
+        // +2 for the square brackets around the key
+        $keyMaxLength = max(array_map('mb_strwidth', array_keys($options))) + 2;
+
+        foreach ($options as $key => $description) {
+            $name = str_pad('  [' . $key . ']  ', $keyMaxLength + 4, ' ');
+            CLI::write(CLI::color($name, 'green') . CLI::wrap($description, 125, $keyMaxLength + 4));
+        }
+
+        return static::prompt(PHP_EOL . array_shift($text), array_keys($options), $validation);
     }
 
     /**
@@ -430,7 +469,7 @@ class CLI
      */
     public static function color(string $text, string $foreground, ?string $background = null, ?string $format = null): string
     {
-        if (! static::$isColored) {
+        if (! static::$isColored || $text === '') {
             return $text;
         }
 
@@ -442,6 +481,48 @@ class CLI
             throw CLIException::forInvalidColor('background', $background);
         }
 
+        $newText = '';
+
+        // Detect if color method was already in use with this text
+        if (strpos($text, "\033[0m") !== false) {
+            $pattern = '/\\033\\[0;.+?\\033\\[0m/u';
+
+            preg_match_all($pattern, $text, $matches);
+            $coloredStrings = $matches[0];
+
+            // No colored string found. Invalid strings with no `\033[0;??`.
+            if ($coloredStrings === []) {
+                return $newText . self::getColoredText($text, $foreground, $background, $format);
+            }
+
+            $nonColoredText = preg_replace(
+                $pattern,
+                '<<__colored_string__>>',
+                $text
+            );
+            $nonColoredChunks = preg_split(
+                '/<<__colored_string__>>/u',
+                $nonColoredText
+            );
+
+            foreach ($nonColoredChunks as $i => $chunk) {
+                if ($chunk !== '') {
+                    $newText .= self::getColoredText($chunk, $foreground, $background, $format);
+                }
+
+                if (isset($coloredStrings[$i])) {
+                    $newText .= $coloredStrings[$i];
+                }
+            }
+        } else {
+            $newText .= self::getColoredText($text, $foreground, $background, $format);
+        }
+
+        return $newText;
+    }
+
+    private static function getColoredText(string $text, string $foreground, ?string $background, ?string $format): string
+    {
         $string = "\033[" . static::$foreground_colors[$foreground] . 'm';
 
         if ($background !== null) {
@@ -450,30 +531,6 @@ class CLI
 
         if ($format === 'underline') {
             $string .= "\033[4m";
-        }
-
-        // Detect if color method was already in use with this text
-        if (strpos($text, "\033[0m") !== false) {
-            // Split the text into parts so that we can see
-            // if any part missing the color definition
-            $chunks = mb_split('\\033\\[0m', $text);
-            // Reset text
-            $text = '';
-
-            foreach ($chunks as $chunk) {
-                if ($chunk === '') {
-                    continue;
-                }
-
-                // If chunk doesn't have colors defined we need to add them
-                if (strpos($chunk, "\033[") === false) {
-                    $chunk = static::color($chunk, $foreground, $background, $format);
-                    // Add color reset before chunk and clear end of the string
-                    $text .= rtrim("\033[0m" . $chunk, "\033[0m");
-                } else {
-                    $text .= $chunk;
-                }
-            }
         }
 
         return $string . $text . "\033[0m";
@@ -826,10 +883,12 @@ class CLI
                 $out .= "-{$name} ";
             }
 
-            // If there's a space, we need to group
-            // so it will pass correctly.
+            if ($value === null) {
+                continue;
+            }
+
             if (mb_strpos($value, ' ') !== false) {
-                $out .= '"' . $value . '" ';
+                $out .= "\"{$value}\" ";
             } elseif ($value !== null) {
                 $out .= "{$value} ";
             }

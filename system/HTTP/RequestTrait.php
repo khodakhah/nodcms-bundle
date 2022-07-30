@@ -223,8 +223,8 @@ trait RequestTrait
         }
 
         // Null filters cause null values to return.
-        $filter = $filter ?? FILTER_DEFAULT;
-        $flags  = is_array($flags) ? $flags : (is_numeric($flags) ? (int) $flags : 0);
+        $filter ??= FILTER_DEFAULT;
+        $flags = is_array($flags) ? $flags : (is_numeric($flags) ? (int) $flags : 0);
 
         // Return all values when $index is null
         if ($index === null) {
@@ -273,13 +273,12 @@ trait RequestTrait
             $value = $this->globals[$method][$index] ?? null;
         }
 
-        // @phpstan-ignore-next-line
         if (is_array($value)
             && (
                 $filter !== FILTER_DEFAULT
                 || (
                     (is_numeric($flags) && $flags !== 0)
-                    || is_array($flags) && count($flags) > 0
+                    || is_array($flags) && $flags !== []
                 )
             )
         ) {

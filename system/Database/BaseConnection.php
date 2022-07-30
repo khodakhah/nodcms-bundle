@@ -14,6 +14,8 @@ namespace CodeIgniter\Database;
 use Closure;
 use CodeIgniter\Database\Exceptions\DatabaseException;
 use CodeIgniter\Events\Events;
+use Exception;
+use stdClass;
 use Throwable;
 
 /**
@@ -239,6 +241,13 @@ abstract class BaseConnection implements ConnectionInterface
     public $likeEscapeChar = '!';
 
     /**
+     * RegExp used to escape identifiers
+     *
+     * @var array
+     */
+    protected $pregEscapeChar = [];
+
+    /**
      * Holds previously looked up data
      * for performance reasons.
      *
@@ -251,14 +260,14 @@ abstract class BaseConnection implements ConnectionInterface
      *
      * @var float
      */
-    protected $connectTime;
+    protected $connectTime = 0.0;
 
     /**
      * How long it took to establish connection.
      *
      * @var float
      */
-    protected $connectDuration;
+    protected $connectDuration = 0.0;
 
     /**
      * If true, no queries will actually be
@@ -319,7 +328,7 @@ abstract class BaseConnection implements ConnectionInterface
      *
      * @var string
      */
-    protected $queryClass = 'CodeIgniter\\Database\\Query';
+    protected $queryClass = Query::class;
 
     /**
      * Saves our connection settings.
@@ -334,6 +343,13 @@ abstract class BaseConnection implements ConnectionInterface
 
         if (class_exists($queryClass)) {
             $this->queryClass = $queryClass;
+        }
+
+        if ($this->failover !== []) {
+            // If there is a failover database, connect now to do failover.
+            // Otherwise, Query Builder creates SQL statement with the main database config
+            // (DBPrefix) even when the main database is down.
+            $this->initialize();
         }
     }
 
@@ -501,7 +517,7 @@ abstract class BaseConnection implements ConnectionInterface
     }
 
     /**
-     * The name of the platform in use (MySQLi, mssql, etc)
+     * The name of the platform in use (MySQLi, Postgre, SQLite3, OCI8, etc)
      */
     public function getPlatform(): string
     {
@@ -558,7 +574,7 @@ abstract class BaseConnection implements ConnectionInterface
      *
      * @param mixed ...$binds
      *
-     * @return BaseResult|bool|Query
+     * @return BaseResult|bool|Query BaseResult when “read” type query, bool when “write” type query, Query when prepared query
      *
      * @todo BC set $queryClass default as null in 4.1
      */
@@ -588,7 +604,14 @@ abstract class BaseConnection implements ConnectionInterface
         $this->lastQuery = $query;
 
         // Run the query for real
-        if (! $this->pretend && false === ($this->resultID = $this->simpleQuery($query->getQuery()))) {
+        try {
+            $exception      = null;
+            $this->resultID = $this->simpleQuery($query->getQuery());
+        } catch (Exception $exception) {
+            $this->resultID = false;
+        }
+
+        if (! $this->pretend && $this->resultID === false) {
             $query->setDuration($startTime, $startTime);
 
             // This will trigger a rollback if transactions are being used
@@ -609,6 +632,15 @@ abstract class BaseConnection implements ConnectionInterface
                         log_message('error', 'Database: Failure during an automated transaction commit/rollback!');
                         break;
                     }
+                }
+
+                if (! $this->pretend) {
+                    // Let others do something with this query.
+                    Events::trigger('DBQuery', $query);
+                }
+
+                if ($exception !== null) {
+                    throw $exception;
                 }
 
                 return false;
@@ -828,7 +860,7 @@ abstract class BaseConnection implements ConnectionInterface
     abstract protected function _transRollback(): bool;
 
     /**
-     * Returns an instance of the query builder for this connection.
+     * Returns a non-shared new instance of the query builder for this connection.
      *
      * @param array|string $tableName
      *
@@ -845,6 +877,14 @@ abstract class BaseConnection implements ConnectionInterface
         $className = str_replace('Connection', 'Builder', static::class);
 
         return new $className($tableName, $this);
+    }
+
+    /**
+     * Returns a new instance of the BaseBuilder class with a cleared FROM clause.
+     */
+    public function newQuery(): BaseBuilder
+    {
+        return $this->table(',')->from([], true);
     }
 
     /**
@@ -876,7 +916,6 @@ abstract class BaseConnection implements ConnectionInterface
         $this->pretend(false);
 
         if ($sql instanceof QueryInterface) {
-            // @phpstan-ignore-next-line
             $sql = $sql->getOriginalQuery();
         }
 
@@ -948,8 +987,12 @@ abstract class BaseConnection implements ConnectionInterface
      * the correct identifiers.
      *
      * @param array|string $item
+     * @param bool         $prefixSingle       Prefix a table name with no segments?
+     * @param bool         $protectIdentifiers Protect table or column names?
+     * @param bool         $fieldExists        Supplied $item contains a column name?
      *
      * @return array|string
+     * @phpstan-return ($item is array ? array : string)
      */
     public function protectIdentifiers($item, bool $prefixSingle = false, ?bool $protectIdentifiers = null, bool $fieldExists = true)
     {
@@ -1119,29 +1162,35 @@ abstract class BaseConnection implements ConnectionInterface
             return $item;
         }
 
-        static $pregEc = [];
-
-        if (empty($pregEc)) {
+        if ($this->pregEscapeChar === []) {
             if (is_array($this->escapeChar)) {
-                $pregEc = [
+                $this->pregEscapeChar = [
                     preg_quote($this->escapeChar[0], '/'),
                     preg_quote($this->escapeChar[1], '/'),
                     $this->escapeChar[0],
                     $this->escapeChar[1],
                 ];
             } else {
-                $pregEc[0] = $pregEc[1] = preg_quote($this->escapeChar, '/');
-                $pregEc[2] = $pregEc[3] = $this->escapeChar;
+                $this->pregEscapeChar[0] = $this->pregEscapeChar[1] = preg_quote($this->escapeChar, '/');
+                $this->pregEscapeChar[2] = $this->pregEscapeChar[3] = $this->escapeChar;
             }
         }
 
         foreach ($this->reservedIdentifiers as $id) {
             if (strpos($item, '.' . $id) !== false) {
-                return preg_replace('/' . $pregEc[0] . '?([^' . $pregEc[1] . '\.]+)' . $pregEc[1] . '?\./i', $pregEc[2] . '$1' . $pregEc[3] . '.', $item);
+                return preg_replace(
+                    '/' . $this->pregEscapeChar[0] . '?([^' . $this->pregEscapeChar[1] . '\.]+)' . $this->pregEscapeChar[1] . '?\./i',
+                    $this->pregEscapeChar[2] . '$1' . $this->pregEscapeChar[3] . '.',
+                    $item
+                );
             }
         }
 
-        return preg_replace('/' . $pregEc[0] . '?([^' . $pregEc[1] . '\.]+)' . $pregEc[1] . '?(\.)?/i', $pregEc[2] . '$1' . $pregEc[3] . '$2', $item);
+        return preg_replace(
+            '/' . $this->pregEscapeChar[0] . '?([^' . $this->pregEscapeChar[1] . '\.]+)' . $this->pregEscapeChar[1] . '?(\.)?/i',
+            $this->pregEscapeChar[2] . '$1' . $this->pregEscapeChar[3] . '$2',
+            $item
+        );
     }
 
     /**
@@ -1185,10 +1234,6 @@ abstract class BaseConnection implements ConnectionInterface
 
         if (is_bool($str)) {
             return ($str === false) ? 0 : 1;
-        }
-
-        if (is_numeric($str) && $str < 0) {
-            return "'{$str}'";
         }
 
         return $str ?? 'NULL';
@@ -1269,8 +1314,7 @@ abstract class BaseConnection implements ConnectionInterface
      */
     public function callFunction(string $functionName, ...$params): bool
     {
-        $driver = strtolower($this->DBDriver);
-        $driver = ($driver === 'postgre' ? 'pg' : $driver) . '_';
+        $driver = $this->getDriverFunctionPrefix();
 
         if (strpos($driver, $functionName) === false) {
             $functionName = $driver . $functionName;
@@ -1285,6 +1329,14 @@ abstract class BaseConnection implements ConnectionInterface
         }
 
         return $functionName(...$params);
+    }
+
+    /**
+     * Get the prefix of the function to access the DB.
+     */
+    protected function getDriverFunctionPrefix(): string
+    {
+        return strtolower($this->DBDriver) . '_';
     }
 
     //--------------------------------------------------------------------
@@ -1411,7 +1463,7 @@ abstract class BaseConnection implements ConnectionInterface
     /**
      * Returns an object with field data
      *
-     * @return array
+     * @return stdClass[]
      */
     public function getFieldData(string $table)
     {
@@ -1500,7 +1552,8 @@ abstract class BaseConnection implements ConnectionInterface
      *
      * Must return an array with keys 'code' and 'message':
      *
-     *  return ['code' => null, 'message' => null);
+     * @return array<string, int|string|null>
+     * @phpstan-return array{code: int|string|null, message: string|null}
      */
     abstract public function error(): array;
 

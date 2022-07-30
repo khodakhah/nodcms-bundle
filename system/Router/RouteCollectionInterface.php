@@ -28,8 +28,8 @@ interface RouteCollectionInterface
     /**
      * Adds a single route to the collection.
      *
-     * @param array|string $to
-     * @param array        $options
+     * @param array|Closure|string $to
+     * @param array                $options
      *
      * @return mixed
      */
@@ -131,7 +131,7 @@ interface RouteCollectionInterface
     /**
      * Returns the current value of the translateURIDashes setting.
      *
-     * @return mixed
+     * @return bool
      */
     public function shouldTranslateURIDashes();
 
@@ -145,7 +145,7 @@ interface RouteCollectionInterface
     /**
      * Returns the raw array of available routes.
      *
-     * @return mixed
+     * @return array
      */
     public function getRoutes();
 
